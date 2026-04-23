@@ -1,7 +1,7 @@
-module QuadraticModelsGurobiExt
+module BQMGurobiExt
 
 using Gurobi
-using QuadraticModelsSolvers
+using BQMSolvers
 
 include("_common.jl")
 
@@ -23,11 +23,11 @@ const _gurobi_statuses = Dict(
     15 => :exception,
 )
 
-function QuadraticModelsSolvers.gurobi(QM::QuadraticModel{T,S}; kwargs...) where {T,S}
-    return QuadraticModelsSolvers.gurobi(_coo_model(QM); kwargs...)
+function BQMSolvers.gurobi(QM::QuadraticModel{T,S}; kwargs...) where {T,S}
+    return BQMSolvers.gurobi(_coo_model(QM); kwargs...)
 end
 
-function QuadraticModelsSolvers.gurobi(
+function BQMSolvers.gurobi(
     QM::QuadraticModel{T,S,M1,M2};
     kwargs...,
 ) where {T,S,M1<:SparseMatrixCOO,M2<:SparseMatrixCOO}
@@ -114,6 +114,15 @@ function QuadraticModelsSolvers.gurobi(
         end
         finalize(env)
     end
+end
+
+# Threaded batch dispatch. Each task extracts a scalar view of its instance
+# (zero-alloc, shares A/Q triplets) and calls the scalar solver above. Pass
+# `threads=1` / `Threads=1` in kwargs to single-thread the inner solver so
+# outer Julia threads aren't fighting it for CPUs. `schedule = :dynamic`
+# helps when per-instance solve times are very uneven.
+function BQMSolvers.gurobi(bqp::BatchQuadraticModels.BatchQuadraticModel{T, MT, VT}; kwargs...) where {T, MT<:AbstractMatrix{T}, VT<:AbstractVector{T}}
+    return BQMSolvers.solve_batch_threaded(BQMSolvers.gurobi, bqp; kwargs...)
 end
 
 end

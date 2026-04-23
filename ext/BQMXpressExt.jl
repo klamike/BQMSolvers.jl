@@ -1,6 +1,6 @@
-module QuadraticModelsXpressExt
+module BQMXpressExt
 
-using QuadraticModelsSolvers
+using BQMSolvers
 using Xpress
 
 include("_common.jl")
@@ -17,11 +17,11 @@ const _xpress_statuses = Dict(
     8 => :exception,
 )
 
-function QuadraticModelsSolvers.xpress(QM::QuadraticModel{T,S}; kwargs...) where {T,S}
-    return QuadraticModelsSolvers.xpress(_coo_model(QM); kwargs...)
+function BQMSolvers.xpress(QM::QuadraticModel{T,S}; kwargs...) where {T,S}
+    return BQMSolvers.xpress(_coo_model(QM); kwargs...)
 end
 
-function QuadraticModelsSolvers.xpress(
+function BQMSolvers.xpress(
     QM::QuadraticModel{T,S,M1,M2};
     method = "b",
     kwargs...,
@@ -118,6 +118,15 @@ function QuadraticModelsSolvers.xpress(
     finally
         Xpress.destroyprob(prob)
     end
+end
+
+# Threaded batch dispatch. Each task extracts a scalar view of its instance
+# (zero-alloc, shares A/Q triplets) and calls the scalar solver above. Pass
+# `threads=1` / `Threads=1` in kwargs to single-thread the inner solver so
+# outer Julia threads aren't fighting it for CPUs. `schedule = :dynamic`
+# helps when per-instance solve times are very uneven.
+function BQMSolvers.xpress(bqp::BatchQuadraticModels.BatchQuadraticModel{T, MT, VT}; kwargs...) where {T, MT<:AbstractMatrix{T}, VT<:AbstractVector{T}}
+    return BQMSolvers.solve_batch_threaded(BQMSolvers.xpress, bqp; kwargs...)
 end
 
 end

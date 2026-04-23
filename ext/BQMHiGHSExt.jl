@@ -1,7 +1,7 @@
-module QuadraticModelsHiGHSExt
+module BQMHiGHSExt
 
 using HiGHS
-using QuadraticModelsSolvers
+using BQMSolvers
 
 include("_common.jl")
 
@@ -36,11 +36,11 @@ function _highs_hessian(QM)
     return Q
 end
 
-function QuadraticModelsSolvers.highs(QM::QuadraticModel{T,S}; kwargs...) where {T,S}
-    return QuadraticModelsSolvers.highs(_coo_model(QM); kwargs...)
+function BQMSolvers.highs(QM::QuadraticModel{T,S}; kwargs...) where {T,S}
+    return BQMSolvers.highs(_coo_model(QM); kwargs...)
 end
 
-function QuadraticModelsSolvers.highs(
+function BQMSolvers.highs(
     QM::QuadraticModel{T,S,M1,M2};
     kwargs...,
 ) where {T,S,M1<:SparseMatrixCOO,M2<:SparseMatrixCOO}
@@ -124,6 +124,15 @@ function QuadraticModelsSolvers.highs(
         multipliers = row_dual,
         elapsed_time = timed.time,
     )
+end
+
+# Threaded batch dispatch. Each task extracts a scalar view of its instance
+# (zero-alloc, shares A/Q triplets) and calls the scalar solver above. Pass
+# `threads=1` / `Threads=1` in kwargs to single-thread the inner solver so
+# outer Julia threads aren't fighting it for CPUs. `schedule = :dynamic`
+# helps when per-instance solve times are very uneven.
+function BQMSolvers.highs(bqp::BatchQuadraticModels.BatchQuadraticModel{T, MT, VT}; kwargs...) where {T, MT<:AbstractMatrix{T}, VT<:AbstractVector{T}}
+    return BQMSolvers.solve_batch_threaded(BQMSolvers.highs, bqp; kwargs...)
 end
 
 end

@@ -1,7 +1,7 @@
-module QuadraticModelsCPLEXExt
+module BQMCPLEXExt
 
 using CPLEX
-using QuadraticModelsSolvers
+using BQMSolvers
 
 include("_common.jl")
 
@@ -94,7 +94,7 @@ function _cplex_input(
     return env, lp
 end
 
-function QuadraticModelsSolvers.cplex(QM::QuadraticModel; method = 4, display = 1, kwargs...)
+function BQMSolvers.cplex(QM::QuadraticModel; method = 4, display = 1, kwargs...)
     env = CPLEX.Env()
     lp = C_NULL
     try
@@ -135,6 +135,15 @@ function QuadraticModelsSolvers.cplex(QM::QuadraticModel; method = 4, display = 
         end
         finalize(env)
     end
+end
+
+# Threaded batch dispatch. Each task extracts a scalar view of its instance
+# (zero-alloc, shares A/Q triplets) and calls the scalar solver above. Pass
+# `threads=1` / `Threads=1` in kwargs to single-thread the inner solver so
+# outer Julia threads aren't fighting it for CPUs. `schedule = :dynamic`
+# helps when per-instance solve times are very uneven.
+function BQMSolvers.cplex(bqp::BatchQuadraticModels.BatchQuadraticModel{T, MT, VT}; kwargs...) where {T, MT<:AbstractMatrix{T}, VT<:AbstractVector{T}}
+    return BQMSolvers.solve_batch_threaded(BQMSolvers.cplex, bqp; kwargs...)
 end
 
 end

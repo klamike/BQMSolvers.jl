@@ -1,5 +1,6 @@
 using LinearAlgebra
 using QuadraticModels
+using BatchQuadraticModels
 using SolverCore
 using SparseArrays
 using SparseMatricesCOO
@@ -68,3 +69,4 @@ end
 function _status_symbol(value, mapping)
     return get(mapping, value, :unknown)
 end
+

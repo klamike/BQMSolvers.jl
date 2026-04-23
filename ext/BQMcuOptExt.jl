@@ -1,6 +1,6 @@
 module QuadraticModelscuOptExt
 
-using QuadraticModelsSolvers
+using BQMSolvers
 using cuOpt
 
 include("_common.jl")
@@ -173,11 +173,11 @@ function _cuopt_stats(QM, solution)
     )
 end
 
-function QuadraticModelsSolvers.cuopt(QM::QuadraticModel{T,S}; kwargs...) where {T,S}
-    return QuadraticModelsSolvers.cuopt(_coo_model(QM); kwargs...)
+function BQMSolvers.cuopt(QM::QuadraticModel{T,S}; kwargs...) where {T,S}
+    return BQMSolvers.cuopt(_coo_model(QM); kwargs...)
 end
 
-function QuadraticModelsSolvers.cuopt(
+function BQMSolvers.cuopt(
     QM::QuadraticModel{T,S,M1,M2};
     kwargs...,
 ) where {T,S,M1<:SparseMatrixCOO,M2<:SparseMatrixCOO}
@@ -199,6 +199,15 @@ function QuadraticModelsSolvers.cuopt(
         cuOpt.cuOptDestroySolverSettings(settings_ref)
         cuOpt.cuOptDestroyProblem(problem_ref)
     end
+end
+
+# Threaded batch dispatch. Each task extracts a scalar view of its instance
+# (zero-alloc, shares A/Q triplets) and calls the scalar solver above. Pass
+# `threads=1` / `Threads=1` in kwargs to single-thread the inner solver so
+# outer Julia threads aren't fighting it for CPUs. `schedule = :dynamic`
+# helps when per-instance solve times are very uneven.
+function BQMSolvers.cuopt(bqp::BatchQuadraticModels.BatchQuadraticModel{T, MT, VT}; kwargs...) where {T, MT<:AbstractMatrix{T}, VT<:AbstractVector{T}}
+    return BQMSolvers.solve_batch_threaded(BQMSolvers.cuopt, bqp; kwargs...)
 end
 
 end

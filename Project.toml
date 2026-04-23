@@ -1,9 +1,11 @@
-name = "QuadraticModelsSolvers"
-uuid = "d6e0d3a1-a3c2-4f7a-b719-9fa6fd950001"
+name = "BQMSolvers"
+uuid = "a1b0d3c2-8d4b-4c5e-9f3a-b7e2f9a40002"
 version = "0.1.0"
 
 [deps]
+BatchQuadraticModels = "412afcf0-3ec6-4826-be17-8d792afa05a8"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+NLPModels = "a4795742-8479-5a88-8948-cc11e1c8c1a6"
 QuadraticModels = "f468eda6-eac5-11e8-05a5-ff9e497bcd19"
 SolverCore = "ff4d7338-4cf1-434d-91df-b86cb86fb843"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
@@ -20,16 +22,21 @@ Xpress = "9e70acf3-d6c9-5be6-b5bd-4e2c73e3e054"
 cuOpt = "29a73d17-8276-40b7-9ffb-d89e58023643"
 
 [extensions]
-QuadraticModelsCOPTExt = "COPT"
-QuadraticModelsCPLEXExt = "CPLEX"
-QuadraticModelsClarabelExt = "Clarabel"
-QuadraticModelsCuPDLPxExt = "CuPDLPx"
-QuadraticModelsGurobiExt = "Gurobi"
-QuadraticModelsHiGHSExt = "HiGHS"
-QuadraticModelsXpressExt = "Xpress"
-QuadraticModelscuOptExt = "cuOpt"
+BQMCOPTExt = "COPT"
+BQMCPLEXExt = "CPLEX"
+BQMClarabelExt = "Clarabel"
+BQMCuPDLPxExt = "CuPDLPx"
+BQMGurobiExt = "Gurobi"
+BQMHiGHSExt = "HiGHS"
+BQMXpressExt = "Xpress"
+BQMcuOptExt = "cuOpt"
+
+[sources]
+BatchQuadraticModels = {path = "../BatchQuadraticModels.jl"}
 
 [compat]
+BatchQuadraticModels = "0.1"
+NLPModels = "0.21"
 COPT = "1"
 CPLEX = "1"
 Clarabel = "0.11"
