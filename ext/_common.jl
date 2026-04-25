@@ -1,18 +1,32 @@
 using LinearAlgebra
-using QuadraticModels
 using BatchQuadraticModels
 using SolverCore
 using SparseArrays
 using SparseMatricesCOO
 
-function _coo_model(QM::QuadraticModel{T,S}; kwargs...) where {T,S}
-    return _coo_model(
-        convert(QuadraticModel{T,S,SparseMatrixCOO{T,Int},SparseMatrixCOO{T,Int}}, QM);
-        kwargs...,
-    )
+# Any scalar LP/QP model from BatchQuadraticModels that the solver extensions
+# can consume uniformly. `LinearModel` carries an empty Hessian.
+const BQMScalar = Union{BatchQuadraticModels.QuadraticModel, BatchQuadraticModels.LinearModel}
+
+# COO triplets for A. `qp.data.A` is a `SparseOperator` wrapping a
+# `SparseMatrixCSC`; `findnz` gives us row/col/val vectors.
+function _A_coo(qp::BQMScalar)
+    A = BatchQuadraticModels.operator_sparse_matrix(qp.data.A)
+    return findnz(A)
 end
 
-_coo_model(QM::QuadraticModel{T,S,M1,M2}; kwargs...) where {T,S,M1<:SparseMatrixCOO,M2<:SparseMatrixCOO} = QM
+# COO triplets for the lower-triangular Hessian. `qp.data.Q` wraps
+# `Symmetric(Q_csc, :L)`; the CSC underneath is already lower-triangular.
+function _Q_coo(qp::BatchQuadraticModels.QuadraticModel{T}) where {T}
+    Q = BatchQuadraticModels.operator_sparse_matrix(qp.data.Q)
+    return findnz(Q)
+end
+_Q_coo(qp::BatchQuadraticModels.LinearModel{T}) where {T} =
+    (Int[], Int[], T[])
+
+# Hessian nnz — `LinearModel` has no Q field, so the fallback is 0.
+_nnzh(qp::BatchQuadraticModels.QuadraticModel) = qp.meta.nnzh
+_nnzh(::BatchQuadraticModels.LinearModel)      = 0
 
 function _sparse_csr(
     I,
@@ -69,4 +83,3 @@ end
 function _status_symbol(value, mapping)
     return get(mapping, value, :unknown)
 end
-

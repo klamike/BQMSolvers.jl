@@ -20,19 +20,17 @@ const _clarabel_statuses = Dict(
     Clarabel.INSUFFICIENT_PROGRESS => :stalled,
 )
 
-function _clarabel_hessian(QM)
-    I = Int[]
-    J = Int[]
-    V = Float64[]
-    for k in eachindex(QM.data.H.vals)
-        i = Int(QM.data.H.rows[k])
-        j = Int(QM.data.H.cols[k])
+# Clarabel wants the upper-triangular Hessian. BQM's `Q_coo` is lower-tri,
+# so swap (i,j) before packing.
+function _clarabel_hessian(qp, nvar::Int)
+    Hrows, Hcols, Hvals = _Q_coo(qp)
+    I = Int[]; J = Int[]; V = Float64[]
+    @inbounds for k in eachindex(Hvals)
+        i = Int(Hrows[k]); j = Int(Hcols[k])
         row, col = i < j ? (i, j) : (j, i)
-        push!(I, row)
-        push!(J, col)
-        push!(V, Float64(QM.data.H.vals[k]))
+        push!(I, row); push!(J, col); push!(V, Float64(Hvals[k]))
     end
-    return sparse(I, J, V, QM.meta.nvar, QM.meta.nvar)
+    return sparse(I, J, V, nvar, nvar)
 end
 
 function _push_bound_row!(I, J, V, b, cones, coeffs, sign, rhs)
@@ -59,36 +57,29 @@ function _push_eq_row!(I, J, V, b, cones, coeffs, rhs)
     return row
 end
 
-function BQMSolvers.clarabel(QM::QuadraticModel{T,S}; kwargs...) where {T,S}
-    return BQMSolvers.clarabel(_coo_model(QM); kwargs...)
-end
-
-function BQMSolvers.clarabel(
-    QM::QuadraticModel{T,S,M1,M2};
-    kwargs...,
-) where {T,S,M1<:SparseMatrixCOO,M2<:SparseMatrixCOO}
-    length(QM.meta.jinf) == 0 || error("infeasible bound metadata is unsupported here")
-    row_terms = [Tuple{Int,Float64}[] for _ in 1:QM.meta.ncon]
-    for k in eachindex(QM.data.A.vals)
-        push!(row_terms[Int(QM.data.A.rows[k])], (Int(QM.data.A.cols[k]), Float64(QM.data.A.vals[k])))
+function BQMSolvers.clarabel(qp::BQMScalar; kwargs...)
+    length(qp.meta.jinf) == 0 || error("infeasible bound metadata is unsupported here")
+    nvar = qp.meta.nvar; ncon = qp.meta.ncon
+    Arows, Acols, Avals = _A_coo(qp)
+    row_terms = [Tuple{Int,Float64}[] for _ in 1:ncon]
+    @inbounds for k in eachindex(Avals)
+        push!(row_terms[Int(Arows[k])], (Int(Acols[k]), Float64(Avals[k])))
     end
-    I = Int[]
-    J = Int[]
-    V = Float64[]
+    I = Int[]; J = Int[]; V = Float64[]
     b = Float64[]
     cones = Clarabel.SupportedCone[]
-    for i in 1:QM.meta.nvar
-        if isfinite(QM.meta.lvar[i])
-            _push_bound_row!(I, J, V, b, cones, [(i, 1.0)], -1.0, -Float64(QM.meta.lvar[i]))
+    for i in 1:nvar
+        if isfinite(qp.meta.lvar[i])
+            _push_bound_row!(I, J, V, b, cones, [(i, 1.0)], -1.0, -Float64(qp.meta.lvar[i]))
         end
-        if isfinite(QM.meta.uvar[i])
-            _push_bound_row!(I, J, V, b, cones, [(i, 1.0)], 1.0, Float64(QM.meta.uvar[i]))
+        if isfinite(qp.meta.uvar[i])
+            _push_bound_row!(I, J, V, b, cones, [(i, 1.0)], 1.0, Float64(qp.meta.uvar[i]))
         end
     end
-    row_map = Vector{Any}(undef, QM.meta.ncon)
-    for i in 1:QM.meta.ncon
-        l = QM.meta.lcon[i]
-        u = QM.meta.ucon[i]
+    row_map = Vector{Any}(undef, ncon)
+    for i in 1:ncon
+        l = qp.meta.lcon[i]
+        u = qp.meta.ucon[i]
         coeffs = row_terms[i]
         if isfinite(l) && isfinite(u)
             if l == u
@@ -109,11 +100,11 @@ function BQMSolvers.clarabel(
             row_map[i] = nothing
         end
     end
-    A = sparse(I, J, V, length(b), QM.meta.nvar)
-    q = Float64.(QM.data.c)
-    P = _clarabel_hessian(QM)
-    c0 = Float64(QM.data.c0)
-    sense = QM.meta.minimize ? 1.0 : -1.0
+    A = sparse(I, J, V, length(b), nvar)
+    q = Float64.(qp.data.c)
+    P = _clarabel_hessian(qp, nvar)
+    c0 = Float64(qp.data.c0[])
+    sense = qp.meta.minimize ? 1.0 : -1.0
     solver_kwargs = Dict{Symbol,Any}(kwargs)
     if haskey(solver_kwargs, :verbose)
         v = solver_kwargs[:verbose]
@@ -125,8 +116,8 @@ function BQMSolvers.clarabel(
     solution = Clarabel.get_solution(solver)
     x = copy(solution.x)
     z = copy(solution.z)
-    y = fill(NaN, QM.meta.ncon)
-    for i in 1:QM.meta.ncon
+    y = fill(NaN, ncon)
+    for i in 1:ncon
         map_i = row_map[i]
         if map_i === nothing
             continue
@@ -138,14 +129,14 @@ function BQMSolvers.clarabel(
             y[i] = z[map_i[3]] - z[map_i[2]]
         end
     end
-    if !QM.meta.minimize
+    if !qp.meta.minimize
         y .*= -1
     end
     return GenericExecutionStats(
-        QM,
+        qp,
         status = _status_symbol(solution.status, _clarabel_statuses),
         solution = x,
-        objective = QM.meta.minimize ? solution.obj_val : -solution.obj_val,
+        objective = qp.meta.minimize ? solution.obj_val : -solution.obj_val,
         primal_feas = info.res_primal,
         dual_feas = info.res_dual,
         iter = Int64(solution.iterations),
@@ -154,11 +145,6 @@ function BQMSolvers.clarabel(
     )
 end
 
-# Threaded batch dispatch. Each task extracts a scalar view of its instance
-# (zero-alloc, shares A/Q triplets) and calls the scalar solver above. Pass
-# `threads=1` / `Threads=1` in kwargs to single-thread the inner solver so
-# outer Julia threads aren't fighting it for CPUs. `schedule = :dynamic`
-# helps when per-instance solve times are very uneven.
 function BQMSolvers.clarabel(bqp::BatchQuadraticModels.BatchQuadraticModel{T, MT, VT}; kwargs...) where {T, MT<:AbstractMatrix{T}, VT<:AbstractVector{T}}
     return BQMSolvers.solve_batch_threaded(BQMSolvers.clarabel, bqp; kwargs...)
 end

@@ -23,82 +23,63 @@ const _gurobi_statuses = Dict(
     15 => :exception,
 )
 
-function BQMSolvers.gurobi(QM::QuadraticModel{T,S}; kwargs...) where {T,S}
-    return BQMSolvers.gurobi(_coo_model(QM); kwargs...)
-end
-
-function BQMSolvers.gurobi(
-    QM::QuadraticModel{T,S,M1,M2};
-    kwargs...,
-) where {T,S,M1<:SparseMatrixCOO,M2<:SparseMatrixCOO}
+function BQMSolvers.gurobi(qp::BQMScalar; kwargs...)
+    nvar = qp.meta.nvar; ncon = qp.meta.ncon
     env = Gurobi.Env(Dict{String,Any}(string(k) => v for (k, v) in kwargs))
     model = Ref{Ptr{Cvoid}}()
     try
         GRBnewmodel(
-            env,
-            model,
-            "",
-            QM.meta.nvar,
-            QM.data.c,
-            QM.meta.lvar,
-            QM.meta.uvar,
-            C_NULL,
-            C_NULL,
+            env, model, "", nvar,
+            Vector{Float64}(qp.data.c),
+            Vector{Float64}(qp.meta.lvar),
+            Vector{Float64}(qp.meta.uvar),
+            C_NULL, C_NULL,
         )
-        GRBsetdblattr(model.x, "ObjCon", QM.data.c0)
-        GRBsetintattr(model.x, "ModelSense", QM.meta.minimize ? 1 : -1)
-        if QM.meta.nnzh > 0
-            hvals = zeros(eltype(QM.data.H.vals), length(QM.data.H.vals))
-            for i in eachindex(QM.data.H.vals)
-                hvals[i] = QM.data.H.rows[i] == QM.data.H.cols[i] ? QM.data.H.vals[i] / 2 : QM.data.H.vals[i]
+        GRBsetdblattr(model.x, "ObjCon", Float64(qp.data.c0[]))
+        GRBsetintattr(model.x, "ModelSense", qp.meta.minimize ? 1 : -1)
+        if _nnzh(qp) > 0
+            Hrows, Hcols, Hvals = _Q_coo(qp)
+            hvals = zeros(eltype(Hvals), length(Hvals))
+            @inbounds for i in eachindex(Hvals)
+                hvals[i] = Hrows[i] == Hcols[i] ? Hvals[i] / 2 : Hvals[i]
             end
             GRBaddqpterms(
-                model.x,
-                length(QM.data.H.cols),
-                convert(Vector{Cint}, QM.data.H.rows .- 1),
-                convert(Vector{Cint}, QM.data.H.cols .- 1),
+                model.x, length(Hcols),
+                convert(Vector{Cint}, Hrows .- 1),
+                convert(Vector{Cint}, Hcols .- 1),
                 hvals,
             )
         end
-        Acsrrowptr, Acsrcolval, Acsrnzval = _sparse_csr(
-            QM.data.A.rows,
-            QM.data.A.cols,
-            QM.data.A.vals,
-            QM.meta.ncon,
-            QM.meta.nvar,
-        )
+        Arows, Acols, Avals = _A_coo(qp)
+        Acsrrowptr, Acsrcolval, Acsrnzval = _sparse_csr(Arows, Acols, Avals, ncon, nvar)
         GRBaddrangeconstrs(
-            model.x,
-            QM.meta.ncon,
-            length(Acsrcolval),
+            model.x, ncon, length(Acsrcolval),
             convert(Vector{Cint}, Acsrrowptr .- 1),
             convert(Vector{Cint}, Acsrcolval .- 1),
             Acsrnzval,
-            QM.meta.lcon,
-            QM.meta.ucon,
+            Vector{Float64}(qp.meta.lcon),
+            Vector{Float64}(qp.meta.ucon),
             C_NULL,
         )
         GRBoptimize(model.x)
-        x = zeros(QM.meta.nvar)
-        y = zeros(QM.meta.ncon)
-        s = zeros(QM.meta.nvar)
-        GRBgetdblattrarray(model.x, "X", 0, QM.meta.nvar, x)
-        GRBgetdblattrarray(model.x, "Pi", 0, QM.meta.ncon, y)
-        GRBgetdblattrarray(model.x, "RC", 0, QM.meta.nvar, s)
-        status = Ref{Cint}()
+        x = zeros(nvar); y = zeros(ncon); s = zeros(nvar)
+        GRBgetdblattrarray(model.x, "X", 0, nvar, x)
+        GRBgetdblattrarray(model.x, "Pi", 0, ncon, y)
+        GRBgetdblattrarray(model.x, "RC", 0, nvar, s)
+        status   = Ref{Cint}()
         baritcnt = Ref{Cint}()
-        objval = Ref{Float64}()
-        p_feas = Ref{Float64}()
-        d_feas = Ref{Float64}()
-        elapsed_time = Ref{Float64}()
+        objval   = Ref{Float64}()
+        p_feas   = Ref{Float64}()
+        d_feas   = Ref{Float64}()
+        elapsed  = Ref{Float64}()
         GRBgetintattr(model.x, "Status", status)
         GRBgetintattr(model.x, "BarIterCount", baritcnt)
         GRBgetdblattr(model.x, "ObjVal", objval)
         GRBgetdblattr(model.x, "ConstrResidual", p_feas)
         GRBgetdblattr(model.x, "DualResidual", d_feas)
-        GRBgetdblattr(model.x, "Runtime", elapsed_time)
+        GRBgetdblattr(model.x, "Runtime", elapsed)
         return GenericExecutionStats(
-            QM,
+            qp,
             status = _status_symbol(status[], _gurobi_statuses),
             solution = x,
             objective = objval[],
@@ -106,7 +87,7 @@ function BQMSolvers.gurobi(
             primal_feas = p_feas[],
             dual_feas = d_feas[],
             multipliers = y,
-            elapsed_time = elapsed_time[],
+            elapsed_time = elapsed[],
         )
     finally
         if model[] != C_NULL
@@ -116,11 +97,6 @@ function BQMSolvers.gurobi(
     end
 end
 
-# Threaded batch dispatch. Each task extracts a scalar view of its instance
-# (zero-alloc, shares A/Q triplets) and calls the scalar solver above. Pass
-# `threads=1` / `Threads=1` in kwargs to single-thread the inner solver so
-# outer Julia threads aren't fighting it for CPUs. `schedule = :dynamic`
-# helps when per-instance solve times are very uneven.
 function BQMSolvers.gurobi(bqp::BatchQuadraticModels.BatchQuadraticModel{T, MT, VT}; kwargs...) where {T, MT<:AbstractMatrix{T}, VT<:AbstractVector{T}}
     return BQMSolvers.solve_batch_threaded(BQMSolvers.gurobi, bqp; kwargs...)
 end

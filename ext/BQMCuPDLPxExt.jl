@@ -38,35 +38,30 @@ function _cupdlpx_setparam(params::Lib.pdhg_parameters_t, field::Symbol, value)
     error("Unsupported CuPDLPx parameter: $(field)")
 end
 
-function BQMSolvers.cupdlpx(QM::QuadraticModel{T,S}; kwargs...) where {T,S}
-    return BQMSolvers.cupdlpx(_coo_model(QM); kwargs...)
-end
-
-function BQMSolvers.cupdlpx(
-    QM::QuadraticModel{T,S,M1,M2};
-    kwargs...,
-) where {T,S,M1<:SparseMatrixCOO,M2<:SparseMatrixCOO}
-    length(QM.meta.jinf) == 0 || error("infeasible bound metadata is unsupported here")
-    QM.meta.nnzh == 0 || error("CuPDLPx only supports linear objectives.")
-    A = sparse(QM.data.A.rows, QM.data.A.cols, QM.data.A.vals, QM.meta.ncon, QM.meta.nvar)
+function BQMSolvers.cupdlpx(qp::BQMScalar; kwargs...)
+    length(qp.meta.jinf) == 0 || error("infeasible bound metadata is unsupported here")
+    _nnzh(qp) == 0 || error("CuPDLPx only supports linear objectives.")
+    nvar = qp.meta.nvar; ncon = qp.meta.ncon
+    Arows, Acols, Avals = _A_coo(qp)
+    A = sparse(Arows, Acols, Avals, ncon, nvar)
     colptr = convert(Vector{Cint}, A.colptr .- 1)
     rowval = convert(Vector{Cint}, A.rowval .- 1)
-    nzval = Float64.(A.nzval)
-    c = Float64.(QM.data.c)
-    lcon = Float64.(QM.meta.lcon)
-    ucon = Float64.(QM.meta.ucon)
-    lvar = Float64.(QM.meta.lvar)
-    uvar = Float64.(QM.meta.uvar)
-    obj_const = Ref{Cdouble}(Float64(QM.data.c0))
-    if !QM.meta.minimize
+    nzval  = Float64.(A.nzval)
+    c      = Float64.(qp.data.c)
+    lcon   = Float64.(qp.meta.lcon)
+    ucon   = Float64.(qp.meta.ucon)
+    lvar   = Float64.(qp.meta.lvar)
+    uvar   = Float64.(qp.meta.uvar)
+    obj_const = Ref{Cdouble}(Float64(qp.data.c0[]))
+    if !qp.meta.minimize
         c .*= -1
         obj_const[] = -obj_const[]
     end
     desc_val = Lib.matrix_desc_t(ntuple(_ -> 0x00, sizeof(Lib.matrix_desc_t)))
     desc_ref = Ref(desc_val)
     desc_ptr = Base.unsafe_convert(Ptr{Lib.matrix_desc_t}, desc_ref)
-    desc_ptr.m = Cint(QM.meta.ncon)
-    desc_ptr.n = Cint(QM.meta.nvar)
+    desc_ptr.m = Cint(ncon)
+    desc_ptr.n = Cint(nvar)
     desc_ptr.fmt = Lib.matrix_csc
     desc_ptr.data.csc = Lib.MatrixCSC(length(rowval), pointer(colptr), pointer(rowval), pointer(nzval))
     params_ref = Ref{Lib.pdhg_parameters_t}()
@@ -81,12 +76,9 @@ function BQMSolvers.cupdlpx(
     try
         GC.@preserve desc_ref colptr rowval nzval c obj_const lcon ucon lvar uvar begin
             prob = Lib.create_lp_problem(
-                pointer(c),
-                desc_ptr,
-                pointer(lcon),
-                pointer(ucon),
-                pointer(lvar),
-                pointer(uvar),
+                pointer(c), desc_ptr,
+                pointer(lcon), pointer(ucon),
+                pointer(lvar), pointer(uvar),
                 Base.unsafe_convert(Ptr{Cdouble}, obj_const),
             )
         end
@@ -94,11 +86,11 @@ function BQMSolvers.cupdlpx(
             result_ptr = Lib.solve_lp_problem(prob, Base.unsafe_convert(Ptr{Lib.pdhg_parameters_t}, params_ref))
         end
         result = unsafe_load(result_ptr)
-        x = copy(unsafe_wrap(Vector{Float64}, result.primal_solution, QM.meta.nvar))
-        y = copy(unsafe_wrap(Vector{Float64}, result.dual_solution, QM.meta.ncon))
-        obj = QM.meta.minimize ? result.primal_objective_value : -result.primal_objective_value
+        x = copy(unsafe_wrap(Vector{Float64}, result.primal_solution, nvar))
+        y = copy(unsafe_wrap(Vector{Float64}, result.dual_solution, ncon))
+        obj = qp.meta.minimize ? result.primal_objective_value : -result.primal_objective_value
         return GenericExecutionStats(
-            QM,
+            qp,
             status = _status_symbol(result.termination_reason, _cupdlpx_statuses),
             solution = x,
             objective = obj,
@@ -114,11 +106,6 @@ function BQMSolvers.cupdlpx(
     end
 end
 
-# Threaded batch dispatch. Each task extracts a scalar view of its instance
-# (zero-alloc, shares A/Q triplets) and calls the scalar solver above. Pass
-# `threads=1` / `Threads=1` in kwargs to single-thread the inner solver so
-# outer Julia threads aren't fighting it for CPUs. `schedule = :dynamic`
-# helps when per-instance solve times are very uneven.
 function BQMSolvers.cupdlpx(bqp::BatchQuadraticModels.BatchQuadraticModel{T, MT, VT}; kwargs...) where {T, MT<:AbstractMatrix{T}, VT<:AbstractVector{T}}
     return BQMSolvers.solve_batch_threaded(BQMSolvers.cupdlpx, bqp; kwargs...)
 end

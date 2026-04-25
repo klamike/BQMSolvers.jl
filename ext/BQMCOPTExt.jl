@@ -30,26 +30,28 @@ function _copt_setparam(prob, name::String, value)
     end
 end
 
-function _copt_row_data(QM)
-    sense = Vector{Cchar}(undef, QM.meta.ncon)
-    bound = Vector{Float64}(undef, QM.meta.ncon)
-    upper = zeros(Float64, QM.meta.ncon)
-    for i in 1:QM.meta.ncon
-        if isfinite(QM.meta.lcon[i]) && isfinite(QM.meta.ucon[i])
-            if QM.meta.lcon[i] == QM.meta.ucon[i]
+function _copt_row_data(qp)
+    ncon = qp.meta.ncon
+    sense = Vector{Cchar}(undef, ncon)
+    bound = Vector{Float64}(undef, ncon)
+    upper = zeros(Float64, ncon)
+    for i in 1:ncon
+        l = qp.meta.lcon[i]; u = qp.meta.ucon[i]
+        if isfinite(l) && isfinite(u)
+            if l == u
                 sense[i] = COPT_EQUAL
-                bound[i] = Float64(QM.meta.ucon[i])
+                bound[i] = Float64(u)
             else
                 sense[i] = COPT_RANGE
-                bound[i] = Float64(QM.meta.ucon[i])
-                upper[i] = Float64(QM.meta.ucon[i] - QM.meta.lcon[i])
+                bound[i] = Float64(u)
+                upper[i] = Float64(u - l)
             end
-        elseif isfinite(QM.meta.lcon[i])
+        elseif isfinite(l)
             sense[i] = COPT_GREATER_EQUAL
-            bound[i] = Float64(QM.meta.lcon[i])
-        elseif isfinite(QM.meta.ucon[i])
+            bound[i] = Float64(l)
+        elseif isfinite(u)
             sense[i] = COPT_LESS_EQUAL
-            bound[i] = Float64(QM.meta.ucon[i])
+            bound[i] = Float64(u)
         else
             sense[i] = COPT_FREE
             bound[i] = 0.0
@@ -58,27 +60,20 @@ function _copt_row_data(QM)
     return sense, bound, upper
 end
 
-function _copt_hessian(QM)
-    I = Cint[]
-    J = Cint[]
-    V = Float64[]
-    for k in eachindex(QM.data.H.vals)
-        push!(I, Cint(QM.data.H.rows[k] - 1))
-        push!(J, Cint(QM.data.H.cols[k] - 1))
-        push!(V, QM.data.H.rows[k] == QM.data.H.cols[k] ? Float64(QM.data.H.vals[k]) / 2 : Float64(QM.data.H.vals[k]))
+function _copt_hessian(qp)
+    Hrows, Hcols, Hvals = _Q_coo(qp)
+    I = Cint[]; J = Cint[]; V = Float64[]
+    @inbounds for k in eachindex(Hvals)
+        push!(I, Cint(Hrows[k] - 1))
+        push!(J, Cint(Hcols[k] - 1))
+        push!(V, Hrows[k] == Hcols[k] ? Float64(Hvals[k]) / 2 : Float64(Hvals[k]))
     end
     return I, J, V
 end
 
-function BQMSolvers.copt(QM::QuadraticModel{T,S}; kwargs...) where {T,S}
-    return BQMSolvers.copt(_coo_model(QM); kwargs...)
-end
-
-function BQMSolvers.copt(
-    QM::QuadraticModel{T,S,M1,M2};
-    kwargs...,
-) where {T,S,M1<:SparseMatrixCOO,M2<:SparseMatrixCOO}
-    length(QM.meta.jinf) == 0 || error("infeasible bound metadata is unsupported here")
+function BQMSolvers.copt(qp::BQMScalar; kwargs...)
+    length(qp.meta.jinf) == 0 || error("infeasible bound metadata is unsupported here")
+    nvar = qp.meta.nvar; ncon = qp.meta.ncon
     env_ref = Ref{Ptr{copt_env}}(C_NULL)
     prob_ref = Ref{Ptr{copt_prob}}(C_NULL)
     _copt_check(COPT_CreateEnv(env_ref), "COPT_CreateEnv")
@@ -88,39 +83,30 @@ function BQMSolvers.copt(
         for (k, v) in kwargs
             _copt_setparam(prob, string(k), v)
         end
-        A = sparse(QM.data.A.rows, QM.data.A.cols, QM.data.A.vals, QM.meta.ncon, QM.meta.nvar)
-        rowSense, rowBound, rowUpper = _copt_row_data(QM)
-        colLower = [isfinite(v) ? Float64(v) : -COPT_INFINITY for v in QM.meta.lvar]
-        colUpper = [isfinite(v) ? Float64(v) : COPT_INFINITY for v in QM.meta.uvar]
+        Arows, Acols, Avals = _A_coo(qp)
+        A = sparse(Arows, Acols, Avals, ncon, nvar)
+        rowSense, rowBound, rowUpper = _copt_row_data(qp)
+        colLower = [isfinite(v) ? Float64(v) : -COPT_INFINITY for v in qp.meta.lvar]
+        colUpper = [isfinite(v) ? Float64(v) : COPT_INFINITY for v in qp.meta.uvar]
         colMatBeg = convert(Vector{Cint}, A.colptr[1:end-1] .- 1)
         colMatCnt = convert(Vector{Cint}, diff(A.colptr))
         colMatIdx = convert(Vector{Cint}, A.rowval .- 1)
         colMatElem = Float64.(A.nzval)
         _copt_check(
             COPT_LoadProb(
-                prob,
-                QM.meta.nvar,
-                QM.meta.ncon,
-                QM.meta.minimize ? COPT_MINIMIZE : COPT_MAXIMIZE,
-                Float64(QM.data.c0),
-                Float64.(QM.data.c),
-                colMatBeg,
-                colMatCnt,
-                colMatIdx,
-                colMatElem,
-                C_NULL,
-                colLower,
-                colUpper,
-                rowSense,
-                rowBound,
-                rowUpper,
-                C_NULL,
-                C_NULL,
+                prob, nvar, ncon,
+                qp.meta.minimize ? COPT_MINIMIZE : COPT_MAXIMIZE,
+                Float64(qp.data.c0[]),
+                Float64.(qp.data.c),
+                colMatBeg, colMatCnt, colMatIdx, colMatElem, C_NULL,
+                colLower, colUpper,
+                rowSense, rowBound, rowUpper,
+                C_NULL, C_NULL,
             ),
             "COPT_LoadProb",
         )
-        if QM.meta.nnzh > 0
-            I, J, V = _copt_hessian(QM)
+        if _nnzh(qp) > 0
+            I, J, V = _copt_hessian(qp)
             _copt_check(COPT_SetQuadObj(prob, length(I), I, J, V), "COPT_SetQuadObj")
         end
         t = @timed _copt_check(COPT_Solve(prob), "COPT_Solve")
@@ -128,9 +114,9 @@ function BQMSolvers.copt(
         _copt_check(COPT_GetIntAttr(prob, "LpStatus", status_ref), "COPT_GetIntAttr(LpStatus)")
         has_sol_ref = Ref{Cint}(0)
         _copt_check(COPT_GetIntAttr(prob, "HasLpSol", has_sol_ref), "COPT_GetIntAttr(HasLpSol)")
-        x = fill(NaN, QM.meta.nvar)
-        y = fill(NaN, QM.meta.ncon)
-        rc = fill(NaN, QM.meta.nvar)
+        x = fill(NaN, nvar)
+        y = fill(NaN, ncon)
+        rc = fill(NaN, nvar)
         if has_sol_ref[] != 0
             _copt_check(COPT_GetLpSolution(prob, x, C_NULL, y, rc), "COPT_GetLpSolution")
         end
@@ -141,7 +127,7 @@ function BQMSolvers.copt(
         COPT_GetIntAttr(prob, "SimplexIter", simplex_ref)
         COPT_GetIntAttr(prob, "BarrierIter", barrier_ref)
         return GenericExecutionStats(
-            QM,
+            qp,
             status = _status_symbol(status_ref[], _copt_statuses),
             solution = x,
             objective = obj_ref[],
@@ -157,11 +143,6 @@ function BQMSolvers.copt(
     end
 end
 
-# Threaded batch dispatch. Each task extracts a scalar view of its instance
-# (zero-alloc, shares A/Q triplets) and calls the scalar solver above. Pass
-# `threads=1` / `Threads=1` in kwargs to single-thread the inner solver so
-# outer Julia threads aren't fighting it for CPUs. `schedule = :dynamic`
-# helps when per-instance solve times are very uneven.
 function BQMSolvers.copt(bqp::BatchQuadraticModels.BatchQuadraticModel{T, MT, VT}; kwargs...) where {T, MT<:AbstractMatrix{T}, VT<:AbstractVector{T}}
     return BQMSolvers.solve_batch_threaded(BQMSolvers.copt, bqp; kwargs...)
 end

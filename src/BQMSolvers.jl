@@ -3,7 +3,6 @@ module BQMSolvers
 export clarabel, copt, cplex, cupdlpx, cuopt, gurobi, highs, xpress
 
 using LinearAlgebra: Symmetric
-using QuadraticModels
 using BatchQuadraticModels
 using SparseArrays
 
@@ -32,42 +31,28 @@ function copt(m, k...)     error("copt is not available; make sure to load the p
 # each instance has different numerical values.
 # ----------------------------------------------------------------------------
 
-# Materialize column `i` of `m` (or replicate shared `v`) as a fresh `Vector{T}`.
-# QuadraticModels.jl's `QPData` calls `similar(c)` internally and expects the
-# result's type to match `c`'s — that breaks for `SubArray{Matrix}` (similar
-# returns Vector), so we allocate a plain Vector instead. One Vector per
-# (c, lvar, uvar, lcon, ucon) = O(nvar + ncon) per instance — tiny next to a
-# solve, and the big A/H matrices are still shared.
-_col_vec(::Type{T}, m::AbstractMatrix, i::Int) where {T} = Vector{T}(@view m[:, i])
-_col_vec(::Type{T}, v::AbstractVector, ::Int) where {T}  = Vector{T}(v)
+# Per-instance c / bound vectors are materialized as fresh `Vector{T}` so the
+# extracted scalar QP has a uniform vector type across its fields —
+# `NLPModels.NLPModelMeta{T, S}` and `SolverCore.GenericExecutionStats` both
+# insist on that uniformity, which defeats any attempt to hand through
+# `SubArray` views of the batch matrices. O(nvar + ncon) per instance, cheap
+# vs a solve; the big A/Q arrays still share pointers across the batch.
+_col_view(m::AbstractMatrix, i::Int) = @view m[:, i]
+_col_view(v::AbstractVector, ::Int)  = v
 
 _maybe_scalar(v::AbstractVector, i::Int) = v[i]
 _maybe_scalar(x::Number, ::Int)          = x
 
-function _scalar_qp_view(bqp::BatchQuadraticModels.BatchQuadraticModel{T, MT, VT}, i::Int,
-                          A::AbstractMatrix, H::AbstractMatrix) where {T, MT<:AbstractMatrix{T}, VT<:AbstractVector{T}}
-    c    = _col_vec(T, bqp.c_batch,    i)
-    c0   = T(_maybe_scalar(bqp.c0_batch, i))
-    lvar = _col_vec(T, bqp.meta.lvar,  i)
-    uvar = _col_vec(T, bqp.meta.uvar,  i)
-    lcon = _col_vec(T, bqp.meta.lcon,  i)
-    ucon = _col_vec(T, bqp.meta.ucon,  i)
-    return QuadraticModels.QuadraticModel(
-        c, H; A = A,
-        lcon = lcon, ucon = ucon, lvar = lvar, uvar = uvar, c0 = c0,
-    )
-end
-
-# Shared A/H matrices for an ObjRHS batch. `bqp.A` wraps a SparseMatrixCSC
-# (non-symmetric); `bqp.Q` wraps `Symmetric(SparseMatrixCSC, :L)`, which
-# QuadraticModel's constructor handles directly.
+# Shared A / lower-triangular Q for an ObjRHS batch: just unwrap the
+# SparseOperator once. Every extracted scalar QP shares the same underlying
+# CSC arrays — zero alloc for the big matrices.
 _shared_A(bqp) = BatchQuadraticModels.operator_sparse_matrix(bqp.A)
-_shared_H(bqp) = bqp.Q.op
+_shared_Q(bqp) = BatchQuadraticModels.operator_sparse_matrix(bqp.Q)
 
-# Per-instance A / H for a Uniform batch. `HostBatchSparseOperator.nzvals`
-# is `(nnz_expanded, nbatch)` — the first `nnz(rows)` rows of each column
-# are the original lower-triangular values (matching `(op.rows, op.cols)`),
-# and any extra rows are symmetric-scatter duplicates we drop.
+# Per-instance A / Q for a Uniform batch. `HostBatchSparseOperator.nzvals`
+# is `(nnz_expanded, nbatch)` — the first `length(op.rows)` rows of each
+# column hold the original lower-triangular values (matching op.rows,
+# op.cols); remaining rows are symmetric-scatter duplicates we drop.
 function _instance_matrix(op::BatchQuadraticModels.HostBatchSparseOperator, i::Int,
                            nrows::Int, ncols::Int)
     nnz_orig = length(op.rows)
@@ -82,27 +67,41 @@ _instance_A(bqp::BatchQuadraticModels.BatchQuadraticModel, i::Int,
              op::BatchQuadraticModels.HostBatchSparseOperator) =
     _instance_matrix(op, i, bqp.meta.ncon, bqp.meta.nvar)
 
-# For Q we wrap in Symmetric(:L) so the QuadraticModel ctor recognises it.
-_instance_H(bqp::BatchQuadraticModels.BatchQuadraticModel, ::Int,
-             ::BatchQuadraticModels.AbstractSparseOperator) = bqp.Q.op
-function _instance_H(bqp::BatchQuadraticModels.BatchQuadraticModel, i::Int,
+_instance_Q(bqp::BatchQuadraticModels.BatchQuadraticModel, ::Int,
+             ::BatchQuadraticModels.AbstractSparseOperator) =
+    BatchQuadraticModels.operator_sparse_matrix(bqp.Q)
+function _instance_Q(bqp::BatchQuadraticModels.BatchQuadraticModel, i::Int,
                       op::BatchQuadraticModels.HostBatchSparseOperator)
     n = bqp.meta.nvar
-    return Symmetric(_instance_matrix(op, i, n, n), :L)
+    return _instance_matrix(op, i, n, n)
+end
+
+function _scalar_qp_alloc(bqp::BatchQuadraticModels.BatchQuadraticModel{T, MT, VT}, i::Int,
+                           A::AbstractMatrix, Q::AbstractMatrix) where {T, MT<:AbstractMatrix{T}, VT<:AbstractVector{T}}
+    c    = Vector{T}(_col_view(bqp.c_batch, i))
+    c0   = T(_maybe_scalar(bqp.c0_batch, i))
+    lvar = Vector{T}(_col_view(bqp.meta.lvar, i))
+    uvar = Vector{T}(_col_view(bqp.meta.uvar, i))
+    lcon = Vector{T}(_col_view(bqp.meta.lcon, i))
+    ucon = Vector{T}(_col_view(bqp.meta.ucon, i))
+    data = BatchQuadraticModels.QPData(A, c, Q;
+        lcon = lcon, ucon = ucon, lvar = lvar, uvar = uvar, c0 = c0,
+    )
+    return BatchQuadraticModels.QuadraticModel(data)
 end
 
 """
     extract_instance(bqp, i)
 
-Return a scalar `QuadraticModels.QuadraticModel` representing the `i`-th
-instance of a `BatchQuadraticModel`. `ObjRHSBatchQuadraticModel` shares A/H
-pointers across every extracted instance (zero-alloc for the matrices);
-`UniformBatchQuadraticModel` rebuilds a per-instance `SparseMatrixCSC` from
-the batch `nzvals` column.
+Return a scalar `BatchQuadraticModels.QuadraticModel` representing the `i`-th
+instance of a `BatchQuadraticModel`. `ObjRHSBatchQuadraticModel` shares
+underlying A/Q arrays across every extracted instance (zero alloc for the
+big matrices); `UniformBatchQuadraticModel` rebuilds a per-instance
+`SparseMatrixCSC` from the batch `nzvals` column.
 """
 function extract_instance(bqp::BatchQuadraticModels.BatchQuadraticModel{T, MT, VT}, i::Int) where {T, MT<:AbstractMatrix{T}, VT<:AbstractVector{T}}
     1 <= i <= bqp.meta.nbatch || throw(BoundsError(bqp, i))
-    return _scalar_qp_view(bqp, i, _instance_A(bqp, i, bqp.A), _instance_H(bqp, i, bqp.Q))
+    return _scalar_qp_alloc(bqp, i, _instance_A(bqp, i, bqp.A), _instance_Q(bqp, i, bqp.Q))
 end
 
 """

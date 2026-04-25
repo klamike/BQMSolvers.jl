@@ -1,4 +1,4 @@
-module QuadraticModelscuOptExt
+module BQMcuOptExt
 
 using BQMSolvers
 using cuOpt
@@ -40,27 +40,9 @@ function _cuopt_setparam(settings, name::String, value)
     end
 end
 
-function _cuopt_qcsr(QM)
-    I = Int[]
-    J = Int[]
-    V = Float64[]
-    for k in eachindex(QM.data.H.vals)
-        i = Int(QM.data.H.rows[k])
-        j = Int(QM.data.H.cols[k])
-        push!(I, i)
-        push!(J, j)
-        push!(V, i == j ? Float64(QM.data.H.vals[k]) / 2 : Float64(QM.data.H.vals[k]))
-    end
-    return _cuopt_csr(I, J, V, QM.meta.nvar, QM.meta.nvar)
-end
-
-function _cuopt_csr(
-    I,
-    J,
-    V,
-    m = isempty(I) ? 0 : maximum(I),
-    n = isempty(J) ? 0 : maximum(J),
-)
+function _cuopt_csr(I, J, V,
+                     m = isempty(I) ? 0 : maximum(I),
+                     n = isempty(J) ? 0 : maximum(J))
     row_offsets = zeros(Int32, m + 1)
     coolen = length(I)
     min(length(J), length(V)) >= coolen ||
@@ -87,57 +69,49 @@ function _cuopt_csr(
     return row_offsets, col_indices, values
 end
 
-function _cuopt_problem(QM::QuadraticModel{T,S,M1,M2}) where {T,S,M1<:SparseMatrixCOO,M2<:SparseMatrixCOO}
-    length(QM.meta.jinf) == 0 || error("infeasible bound metadata is unsupported here")
-    Arowptr, Acolind, Avals = _cuopt_csr(
-        QM.data.A.rows,
-        QM.data.A.cols,
-        QM.data.A.vals,
-        QM.meta.ncon,
-        QM.meta.nvar,
-    )
-    qrowptr, qcolind, qvals = _cuopt_qcsr(QM)
-    sense = QM.meta.minimize ? cuOpt.CUOPT_MINIMIZE : cuOpt.CUOPT_MAXIMIZE
+function _cuopt_qcsr(qp, nvar::Int)
+    Hrows, Hcols, Hvals = _Q_coo(qp)
+    I = Int[]; J = Int[]; V = Float64[]
+    @inbounds for k in eachindex(Hvals)
+        i = Int(Hrows[k]); j = Int(Hcols[k])
+        push!(I, i); push!(J, j)
+        push!(V, i == j ? Float64(Hvals[k]) / 2 : Float64(Hvals[k]))
+    end
+    return _cuopt_csr(I, J, V, nvar, nvar)
+end
+
+function _cuopt_problem(qp::BQMScalar)
+    length(qp.meta.jinf) == 0 || error("infeasible bound metadata is unsupported here")
+    nvar = qp.meta.nvar; ncon = qp.meta.ncon
+    Arows, Acols, Avals = _A_coo(qp)
+    Arowptr, Acolind, Avals_csr = _cuopt_csr(Arows, Acols, Avals, ncon, nvar)
+    qrowptr, qcolind, qvals = _cuopt_qcsr(qp, nvar)
+    sense = qp.meta.minimize ? cuOpt.CUOPT_MINIMIZE : cuOpt.CUOPT_MAXIMIZE
     problem_ref = Ref{cuOpt.cuOptOptimizationProblem}()
     if isempty(qvals)
-        variable_types = fill(Cchar(cuOpt.CUOPT_CONTINUOUS), QM.meta.nvar)
+        variable_types = fill(Cchar(cuOpt.CUOPT_CONTINUOUS), nvar)
         _cuopt_check(
             cuOpt.cuOptCreateRangedProblem(
-                Int32(QM.meta.ncon),
-                Int32(QM.meta.nvar),
-                sense,
-                Float64(QM.data.c0),
-                Float64.(QM.data.c),
-                Arowptr,
-                Acolind,
-                Avals,
-                Float64.(QM.meta.lcon),
-                Float64.(QM.meta.ucon),
-                Float64.(QM.meta.lvar),
-                Float64.(QM.meta.uvar),
-                variable_types,
-                problem_ref,
+                Int32(ncon), Int32(nvar), sense,
+                Float64(qp.data.c0[]),
+                Float64.(qp.data.c),
+                Arowptr, Acolind, Avals_csr,
+                Float64.(qp.meta.lcon), Float64.(qp.meta.ucon),
+                Float64.(qp.meta.lvar), Float64.(qp.meta.uvar),
+                variable_types, problem_ref,
             ),
             "cuOptCreateRangedProblem",
         )
     else
         _cuopt_check(
             cuOpt.cuOptCreateQuadraticRangedProblem(
-                Int32(QM.meta.ncon),
-                Int32(QM.meta.nvar),
-                sense,
-                Float64(QM.data.c0),
-                Float64.(QM.data.c),
-                qrowptr,
-                qcolind,
-                qvals,
-                Arowptr,
-                Acolind,
-                Avals,
-                Float64.(QM.meta.lcon),
-                Float64.(QM.meta.ucon),
-                Float64.(QM.meta.lvar),
-                Float64.(QM.meta.uvar),
+                Int32(ncon), Int32(nvar), sense,
+                Float64(qp.data.c0[]),
+                Float64.(qp.data.c),
+                qrowptr, qcolind, qvals,
+                Arowptr, Acolind, Avals_csr,
+                Float64.(qp.meta.lcon), Float64.(qp.meta.ucon),
+                Float64.(qp.meta.lvar), Float64.(qp.meta.uvar),
                 problem_ref,
             ),
             "cuOptCreateQuadraticRangedProblem",
@@ -146,14 +120,15 @@ function _cuopt_problem(QM::QuadraticModel{T,S,M1,M2}) where {T,S,M1<:SparseMatr
     return problem_ref
 end
 
-function _cuopt_stats(QM, solution)
+function _cuopt_stats(qp, solution)
     status_ref = Ref{Int32}(0)
     _cuopt_check(
         cuOpt.cuOptGetTerminationStatus(solution, status_ref),
         "cuOptGetTerminationStatus",
     )
-    x = zeros(Float64, QM.meta.nvar)
-    y = zeros(Float64, QM.meta.ncon)
+    nvar = qp.meta.nvar; ncon = qp.meta.ncon
+    x = zeros(Float64, nvar)
+    y = zeros(Float64, ncon)
     _cuopt_check(cuOpt.cuOptGetPrimalSolution(solution, x), "cuOptGetPrimalSolution")
     cuOpt.cuOptGetDualSolution(solution, y)
     obj = Ref{Float64}(NaN)
@@ -161,7 +136,7 @@ function _cuopt_stats(QM, solution)
     cuOpt.cuOptGetObjectiveValue(solution, obj)
     cuOpt.cuOptGetSolveTime(solution, solve_time)
     return GenericExecutionStats(
-        QM,
+        qp,
         status = _status_symbol(status_ref[], _cuopt_statuses),
         solution = x,
         objective = obj[],
@@ -173,15 +148,8 @@ function _cuopt_stats(QM, solution)
     )
 end
 
-function BQMSolvers.cuopt(QM::QuadraticModel{T,S}; kwargs...) where {T,S}
-    return BQMSolvers.cuopt(_coo_model(QM); kwargs...)
-end
-
-function BQMSolvers.cuopt(
-    QM::QuadraticModel{T,S,M1,M2};
-    kwargs...,
-) where {T,S,M1<:SparseMatrixCOO,M2<:SparseMatrixCOO}
-    problem_ref = _cuopt_problem(QM)
+function BQMSolvers.cuopt(qp::BQMScalar; kwargs...)
+    problem_ref = _cuopt_problem(qp)
     settings_ref = Ref{cuOpt.cuOptSolverSettings}()
     _cuopt_check(cuOpt.cuOptCreateSolverSettings(settings_ref), "cuOptCreateSolverSettings")
     for (k, v) in kwargs
@@ -193,7 +161,7 @@ function BQMSolvers.cuopt(
             cuOpt.cuOptSolve(problem_ref[], settings_ref[], solution_ref),
             "cuOptSolve",
         )
-        return _cuopt_stats(QM, solution_ref[])
+        return _cuopt_stats(qp, solution_ref[])
     finally
         cuOpt.cuOptDestroySolution(solution_ref)
         cuOpt.cuOptDestroySolverSettings(settings_ref)
@@ -201,11 +169,6 @@ function BQMSolvers.cuopt(
     end
 end
 
-# Threaded batch dispatch. Each task extracts a scalar view of its instance
-# (zero-alloc, shares A/Q triplets) and calls the scalar solver above. Pass
-# `threads=1` / `Threads=1` in kwargs to single-thread the inner solver so
-# outer Julia threads aren't fighting it for CPUs. `schedule = :dynamic`
-# helps when per-instance solve times are very uneven.
 function BQMSolvers.cuopt(bqp::BatchQuadraticModels.BatchQuadraticModel{T, MT, VT}; kwargs...) where {T, MT<:AbstractMatrix{T}, VT<:AbstractVector{T}}
     return BQMSolvers.solve_batch_threaded(BQMSolvers.cuopt, bqp; kwargs...)
 end
